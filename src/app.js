@@ -15,46 +15,100 @@ const { log4js, cleanLogs, catLogs } = require("./logger");
 
 const tokenDir = ".token";
 
+// 每个账号最多执行 3 次（首次 + 2 次重试）
+const MAX_ATTEMPTS = 3;
+const RETRY_DELAY = 10000;
+
 sdkLogger.configure({
   isDebugEnabled: process.env.CLOUD189_VERBOSE === "1",
 });
 
-// 提取简短错误原因
-const getErrorReason = (error, logStart) => {
-  const events = recording.replay().slice(logStart);
-
-  // 获取当前账号执行期间 SDK 记录的错误
-  const messages = events
+// 提取错误原因并判断是否需要重试
+const getErrorInfo = (error, logStart) => {
+  const sdkErrors = recording.replay()
+    .slice(logStart)
     .filter((event) => {
       const level = event.level?.levelStr || String(event.level);
-      return level.toUpperCase() === "ERROR";
+      return level.toUpperCase().includes("ERROR");
     })
     .flatMap((event) => event.data || [])
     .map((item) => {
-      const message = item?.message || String(item);
-
-      return message
-        .split(/\r?\n/)[0]
-        .replace(/^(RequestError|Error):\s*/i, "")
-        .trim();
+      if (item instanceof Error) {
+        return `${item.message}\n${item.stack || ""}`;
+      }
+      return String(item?.stack || item?.message || item);
     })
-    .filter(Boolean);
+    .join("\n");
 
-  // 优先提取 SDK 返回的具体原因
-  const detail = messages.find(
-    (message) =>
-      /验证码|账户|账号|密码|设备|登录|认证|超时|连接|ETIMEDOUT|ECONNRESET/i.test(
-        message
-      ) && !message.includes("Can not get session")
-  );
+  const raw = [
+    error?.message || "",
+    error?.stack || "",
+    error?.code || "",
+    error?.cause?.message || "",
+    error?.cause?.code || "",
+    typeof error?.response?.body === "string"
+      ? error.response.body
+      : "",
+    sdkErrors,
+  ].join("\n");
 
-  // 没有具体错误则使用原始错误信息
-  const reason = detail || error?.message || "未知错误";
+  // 账号、验证码等认证错误：不重试
+  const authPatterns = [
+    /图形验证码错误[^\r\n]*/,
+    /(?:账户名|账号)或密码错误[^\r\n]*/,
+    /密码错误[^\r\n]*/,
+    /账号不存在[^\r\n]*/,
+    /设备锁|设备验证|二次验证/,
+  ];
 
-  return String(reason)
-    .split(/\r?\n/)[0]
-    .replace(/^(RequestError|Error):\s*/i, "")
-    .slice(0, 120);
+  for (const pattern of authPatterns) {
+    const match = raw.match(pattern);
+
+    if (match) {
+      return {
+        reason: match[0].slice(0, 120),
+        retryable: false,
+      };
+    }
+  }
+
+  // 网络错误：允许重试
+  const timeoutErrors =
+    /ETIMEDOUT|ERR_SOCKET_CLOSED_BEFORE_CONNECTION/i;
+
+  if (timeoutErrors.test(raw)) {
+    return {
+      reason: "网络连接超时",
+      retryable: true,
+    };
+  }
+
+  const networkErrors =
+    /ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENETUNREACH/i;
+
+  if (networkErrors.test(raw)) {
+    return {
+      reason: "网络连接异常",
+      retryable: true,
+    };
+  }
+
+  // SDK 外层可能只返回通用的 Session 错误
+  if (/Can not get session/i.test(raw)) {
+    return {
+      reason: "无法获取登录会话",
+      retryable: true,
+    };
+  }
+
+  // 其他错误保留简短描述
+  return {
+    reason: String(error?.message || "未知错误")
+      .split(/\r?\n/)[0]
+      .replace(/^(RequestError|Error):\s*/i, "")
+      .slice(0, 120),
+    retryable: false,
+  };
 };
 
 // 个人任务签到
@@ -68,83 +122,100 @@ const doUserTask = async (cloudClient, logger) => {
   logger.info(`个人签到任务: 获得 ${netdiskBonus}M 空间`);
 };
 
-// 执行单个账号
+// 执行单个账号，支持独立重试
 const run = async (
   userName,
   password,
   userSizeInfoMap,
   logger
 ) => {
-  if (userName && password) {
-    const before = Date.now();
+  if (!userName || !password) {
+    return;
+  }
 
-    // 记录当前账号执行前的 SDK 日志位置
-    const logStart = recording.replay().length;
+  const before = Date.now();
 
-    try {
-      logger.log("开始执行");
+  logger.log("开始执行");
 
-      const cloudClient = new CloudClient({
-        username: userName,
-        password,
-        token: new FileTokenStore(
-          `${tokenDir}/${userName}.json`
-        ),
-      });
+  try {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // 每次尝试单独记录 SDK 日志位置
+      const logStart = recording.replay().length;
 
-      const beforeUserSizeInfo =
-        await cloudClient.getUserSizeInfo();
+      try {
+        const cloudClient = new CloudClient({
+          username: userName,
+          password,
+          token: new FileTokenStore(
+            `${tokenDir}/${userName}.json`
+          ),
+        });
 
-      userSizeInfoMap.set(userName, {
-        cloudClient,
-        userSizeInfo: beforeUserSizeInfo,
-        logger,
-      });
+        const beforeUserSizeInfo =
+          await cloudClient.getUserSizeInfo();
 
-      await Promise.all([
-        doUserTask(cloudClient, logger),
-      ]);
+        await doUserTask(cloudClient, logger);
 
-    } catch (e) {
-      // 提取简短错误原因用于通知
-      const reason = getErrorReason(e, logStart);
+        // 签到成功后再加入容量统计
+        userSizeInfoMap.set(userName, {
+          cloudClient,
+          userSizeInfo: beforeUserSizeInfo,
+          logger,
+        });
 
-      logger.error(`签到失败：${reason}`);
+        return true;
 
-      // GitHub Actions 控制台保留完整错误
-      console.error(e);
+      } catch (e) {
+        const { reason, retryable } =
+          getErrorInfo(e, logStart);
 
-      // 网络异常继续抛出，交给 Workflow 重试
-      if (
-        e.code === "ECONNRESET" ||
-        e.code === "ETIMEDOUT"
-      ) {
-        logger.error("请求超时");
-        throw e;
+        // 完整异常只输出到 GitHub Actions
+        console.error(
+          `[${mask(userName, 3, 7)}] 第 ${attempt} 次尝试失败:`,
+          e
+        );
+
+        // 可重试错误，且没有超过最大次数
+        if (retryable && attempt < MAX_ATTEMPTS) {
+          console.warn(
+            `[${mask(userName, 3, 7)}] ${reason}，` +
+            `${RETRY_DELAY / 1000} 秒后重试 ` +
+            `(${attempt}/${MAX_ATTEMPTS})`
+          );
+
+          await delay(RETRY_DELAY);
+          continue;
+        }
+
+        // 最终失败，只记录简短原因用于推送
+        const retryInfo = retryable
+          ? `（已尝试 ${attempt} 次）`
+          : "";
+
+        logger.error(`签到失败：${reason}${retryInfo}`);
+
+        return false;
       }
-
-    } finally {
-      logger.log(
-        `执行完毕, 耗时 ${(
-          (Date.now() - before) /
-          1000
-        ).toFixed(2)} 秒`
-      );
     }
+  } finally {
+    logger.log(
+      `执行完毕, 耗时 ${(
+        (Date.now() - before) / 1000
+      ).toFixed(2)} 秒`
+    );
   }
 };
 
 // 开始执行程序
 async function main() {
-  // 用于统计实际容量变化
   const userSizeInfoMap = new Map();
 
+  // 按顺序执行各个账号
   for (let index = 0; index < accounts.length; index++) {
     const account = accounts[index];
     const { userName, password } = account;
 
     const userNameInfo = mask(userName, 3, 7);
-
     const logger = log4js.getLogger(userName);
 
     logger.addContext("user", userNameInfo);
@@ -157,43 +228,53 @@ async function main() {
     );
   }
 
-  // 数据汇总
+  // 容量变化统计
   for (const [
     userName,
     { cloudClient, userSizeInfo, logger },
   ] of userSizeInfoMap) {
-    const afterUserSizeInfo =
-      await cloudClient.getUserSizeInfo();
+    try {
+      const afterUserSizeInfo =
+        await cloudClient.getUserSizeInfo();
 
-    logger.log(
-      `个人容量：⬆️  ${(
-        (
-          afterUserSizeInfo.cloudCapacityInfo.totalSize -
-          userSizeInfo.cloudCapacityInfo.totalSize
-        ) /
-        1024 /
-        1024
-      ).toFixed(2)}M/${(
-        afterUserSizeInfo.cloudCapacityInfo.totalSize /
-        1024 /
-        1024 /
-        1024
-      ).toFixed(2)}G`,
+      logger.log(
+        `个人容量：⬆️  ${(
+          (
+            afterUserSizeInfo.cloudCapacityInfo.totalSize -
+            userSizeInfo.cloudCapacityInfo.totalSize
+          ) /
+          1024 /
+          1024
+        ).toFixed(2)}M/${(
+          afterUserSizeInfo.cloudCapacityInfo.totalSize /
+          1024 /
+          1024 /
+          1024
+        ).toFixed(2)}G`,
 
-      `家庭容量：⬆️  ${(
-        (
-          afterUserSizeInfo.familyCapacityInfo.totalSize -
-          userSizeInfo.familyCapacityInfo.totalSize
-        ) /
-        1024 /
-        1024
-      ).toFixed(2)}M/${(
-        afterUserSizeInfo.familyCapacityInfo.totalSize /
-        1024 /
-        1024 /
-        1024
-      ).toFixed(2)}G`
-    );
+        `家庭容量：⬆️  ${(
+          (
+            afterUserSizeInfo.familyCapacityInfo.totalSize -
+            userSizeInfo.familyCapacityInfo.totalSize
+          ) /
+          1024 /
+          1024
+        ).toFixed(2)}M/${(
+          afterUserSizeInfo.familyCapacityInfo.totalSize /
+          1024 /
+          1024 /
+          1024
+        ).toFixed(2)}G`
+      );
+    } catch (e) {
+      // 容量查询失败不影响其他账号
+      console.error(
+        `[${mask(userName, 3, 7)}] 容量查询失败:`,
+        e
+      );
+
+      logger.error("容量查询失败");
+    }
   }
 }
 
@@ -202,16 +283,15 @@ async function main() {
   try {
     await main();
 
-    // 等待日志文件写入
+    // 等待日志写入
     await delay(1000);
 
   } finally {
-    // 仅推送业务日志，不包含 SDK 完整异常堆栈
+    // 只推送简洁的账号日志
     const logs = catLogs();
 
     push("天翼云盘自动签到任务", logs);
 
-    // 清理日志
     recording.erase();
     cleanLogs();
   }
