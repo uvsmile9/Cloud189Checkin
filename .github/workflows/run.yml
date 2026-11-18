@@ -1,85 +1,165 @@
+
 name: Cloud check in action
+
 on:
   push:
     branches:
       - main
   watch:
-    types: started
+    types: [started]
   workflow_dispatch:
   schedule:
-    - cron: 35 2 * * *
+    # UTC 02:35 = 北京时间 10:35
+    - cron: "35 4 * * *"
+
+# 防止多次签到同时运行
+concurrency:
+  group: cloud189-checkin-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
-  build-and-deploy:
+  checkin:
+    name: Cloud189 Checkin
     runs-on: ubuntu-latest
     environment: user
+    timeout-minutes: 45
+
+    permissions:
+      contents: write
+
     steps:
-      - name: 🔌 Check out code
-        uses: actions/checkout@main
+      - name: 🔌 Checkout
+        uses: actions/checkout@v7
 
-      - name: 🔨 Setup Node.js environment
-        uses: actions/setup-node@main
+      - name: 🔨 Setup Node.js
+        uses: actions/setup-node@v7
         with:
-          node-version: 18
-          cache: npm
+          node-version: "24"
 
-      - name: 👾 Check if Debug is true
-        if: vars.debug == '1'
-        run: |
-          echo "CLOUD189_VERBOSE=1" >> $GITHUB_ENV
-      
-      - name: 📹 Restore cached Cookie
-        id: cache-cookie-restore
-        uses: actions/cache/restore@v4
+      - name: 🐛 Enable debug
+        if: ${{ vars.debug == '1' }}
+        run: echo "CLOUD189_VERBOSE=1" >> "$GITHUB_ENV"
+
+      # 仍然缓存认证信息，注意缓存并非安全的凭证存储
+      - name: 📹 Restore Cookie
+        uses: actions/cache/restore@v6
         with:
           path: .token
-          key: cloud189-token-${{ hashFiles('.token/*.json') }}
-          restore-keys: cloud189-token-
+          key: cloud189-token-v2-restore
+          restore-keys: |
+            cloud189-token-v2-
 
-      - name: 🔧 Init secrets
-        uses: shine1594/secrets-to-env-action@master
+      # 将已有 GitHub Secrets 注入运行环境
+      # 无需第三方 secrets-to-env-action
+      - name: 🔐 Load Secrets
+        shell: bash
+        env:
+          ALL_SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+
+          const allowed = new Set([
+            'TY_ACCOUNTS',
+            'SENDKEY',
+            'TELEGRAM_BOT_TOKEN',
+            'TELEGRAM_CHAT_ID',
+            'WECOM_BOT_KEY',
+            'WECOM_BOT_TELPHONE',
+            'WX_PUSHER_APP_TOKEN',
+            'WX_PUSHER_UID',
+            'PUSH_PLUS_TOKEN',
+            'SHOWDOC_KEY',
+            'BARK_KEY',
+            'BARK_SERVER',
+            'WPUSH_APIKEY',
+            'WPUSH_CHANNEL',
+            'WPUSH_TOPIC_CODE'
+          ]);
+
+          const secrets = JSON.parse(
+            process.env.ALL_SECRETS_JSON || '{}'
+          );
+
+          for (const [key, value] of Object.entries(secrets)) {
+            const isAccount = /^TY_(USERNAME|PASSWORD)_[1-9]\d*$/.test(key);
+
+            if (!allowed.has(key) && !isAccount) continue;
+            if (typeof value !== 'string') continue;
+
+            const marker = `EOF_${crypto.randomBytes(16).toString('hex')}`;
+
+            fs.appendFileSync(
+              process.env.GITHUB_ENV,
+              `${key}<<${marker}\n${value}\n${marker}\n`
+            );
+          }
+          NODE
+
+      - name: 🔎 Validate account configuration
+        shell: bash
+        run: |
+          if [[ -z "${TY_ACCOUNTS:-}" ]] && \
+             [[ -z "${TY_USERNAME_1:-}" || -z "${TY_PASSWORD_1:-}" ]]; then
+            echo "::error::Missing Cloud189 account secrets"
+            exit 1
+          fi
+
+      - name: 📦 Install dependencies
+        shell: bash
+        run: |
+          if [[ -f package-lock.json ]]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: 🚀 Run checkin
+        uses: nick-fields/retry@v3
         with:
-          secrets: ${{ toJSON(secrets) }}
-          secrets_env: production
-          prefix_prod: ""
-          file_name_prod: .env
-
-      - name: 📡 Init dependencies
-        run: npm install
-
-      - name: 🚀 Run
-        uses: nick-fields/retry@master
-        with:
-          timeout_minutes: 30
+          timeout_minutes: 10
           max_attempts: 3
+          retry_wait_seconds: 15
           command: npm start
 
-      - name: 🔑 Compute token hash
-        if: always()
-        run: |
-          NEW_HASH=$(find .token -name '*.json' -exec sha256sum {} \; 2>/dev/null | sha256sum | cut -d' ' -f1)
-          echo "TOKEN_HASH=${NEW_HASH}" >> $GITHUB_ENV
-
-      - name: 📹 Save cached Cookie
-        if: always() && env.TOKEN_HASH != ''
-        uses: actions/cache/save@v4
+      # 只在签到命令成功且存在 JSON 文件时保存
+      - name: 📹 Save Cookie
+        if: ${{ success() && hashFiles('.token/**/*.json') != '' }}
+        uses: actions/cache/save@v6
         with:
           path: .token
-          key: cloud189-token-${{ env.TOKEN_HASH }}
+          key: cloud189-token-v2-${{ hashFiles('.token/**/*.json') }}
 
+      # 仅定时运行时提交空 Commit
       - name: 🚗 Keep Running
-        if: github.event_name == 'schedule'
+        if: ${{ github.event_name == 'schedule' }}
+        shell: bash
         run: |
-          git config --local user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
-          git config --local user.name "${{ github.actor }}"
-          git remote set-url origin https://${{ github.actor }}:${{ github.token }}@github.com/${{ github.repository }}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git pull --rebase --autostash
           git commit --allow-empty -m "Keep Running..."
-          git push
+          git push origin "HEAD:${GITHUB_REF_NAME}"
 
-      - name: 🎉 Delete old workflow run
-        uses: Mattraks/delete-workflow-runs@main
+  cleanup:
+    name: Cleanup workflow runs
+    needs: checkin
+    if: ${{ github.event_name == 'schedule' && needs.checkin.result == 'success' }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: 🧹 Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2.1.0
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
-          retain_days: 0
+          delete_workflow_pattern: "Cloud check in action"
+          retain_days: 7
           keep_minimum_runs: 50
+          dry_run: false
